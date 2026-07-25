@@ -16,6 +16,7 @@ from .models import GroupInfo, UserData
 from .platform_helper import PlatformHelper
 from .validators import Validators
 from .group_id_utils import extract_numeric_group_id, is_placeholder_group_name, normalize_group_id
+from .t2i_renderer import render_html
 
 
 class StatsMixin:
@@ -443,8 +444,7 @@ class StatsMixin:
                 self.logger.warning("里程碑推送：图片生成器未初始化")
                 return
 
-            # 生成里程碑个人成就卡片
-            image_path = await self.image_generator.generate_milestone_image(
+            html_content = await self.image_generator.generate_milestone_html(
                 user_id=user_id,
                 nickname=nickname,
                 milestone_count=current_count,
@@ -457,20 +457,17 @@ class StatsMixin:
                 group_info=group_info
             )
 
-            if not image_path:
+            if not html_content:
                 self.logger.warning("里程碑推送：个人卡片生成失败")
                 return
 
-            # 构建消息并推送
             from astrbot.api.event import MessageChain
             message_chain = MessageChain()
-            message_chain = message_chain.file_image(image_path)
+            image_url = await render_html(self._get_t2i_endpoint(), html_content, 600)
+            message_chain = message_chain.url_image(image_url)
 
-            try:
-                await self.context.send_message(unified_msg_origin, message_chain)
-                self.logger.info(f"✅ 里程碑推送成功: {nickname} 发言 {current_count} 次")
-            finally:
-                self._schedule_file_cleanup(image_path)
+            await self.context.send_message(unified_msg_origin, message_chain)
+            self.logger.info(f"✅ 里程碑推送成功: {nickname} 发言 {current_count} 次")
 
         except Exception as e:
             self.logger.error(f"里程碑推送失败: {e}", exc_info=True)

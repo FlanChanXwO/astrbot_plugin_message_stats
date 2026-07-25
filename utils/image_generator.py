@@ -1,6 +1,6 @@
 """
-图片生成模块
-负责将HTML模板转换为排行榜图片
+HTML 模板生成模块
+负责生成交给 AstrBot T2I 服务渲染的排行榜 HTML
 """
 
 import asyncio
@@ -8,18 +8,14 @@ import aiofiles
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
-import tempfile
 import os
-import traceback
 import hashlib
-import json
-import shutil
-import uuid
 import html
 import base64
 from urllib.parse import quote
 
 from astrbot.api import logger as astrbot_logger
+from astrbot.api.star import StarTools
 
 # 异步 HTTP 请求（用于获取 TG/Discord 头像）
 try:
@@ -32,10 +28,6 @@ except ImportError:
 # 从集中管理的常量模块导入图片生成配置
 from .constants import (
     IMAGE_WIDTH,
-    VIEWPORT_HEIGHT,
-    BROWSER_TIMEOUT,
-    DEFAULT_FONT_SIZE,
-    ROW_HEIGHT
 )
 
 # Jinja2模板引擎
@@ -45,13 +37,6 @@ try:
 except ImportError:
     JINJA2_AVAILABLE = False
     astrbot_logger.warning("Jinja2未安装，将使用不安全的字符串拼接方式")
-
-try:
-    from playwright.async_api import async_playwright, Browser, Page
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-    astrbot_logger.warning("Playwright未安装，图片生成功能将不可用")
 
 from .models import UserData, GroupInfo, PluginConfig
 from .exception_handlers import safe_generation, safe_file_operation
@@ -69,7 +54,7 @@ class ImageGenerationError(Exception):
         message (str): 异常消息，描述具体的错误原因
         
     Example:
-        >>> raise ImageGenerationError("Playwright未安装，无法生成图片")
+        >>> raise ImageGenerationError("HTML 模板生成失败")
     """
     pass
 
@@ -148,37 +133,10 @@ def _gen_bubble_layout(users):
 
 
 class ImageGenerator:
-    """图片生成器
-    
-    负责将HTML模板转换为排行榜图片。支持Playwright浏览器自动化和Jinja2模板渲染。
-    
-    主要功能:
-        - 使用Playwright浏览器生成高质量排行榜图片
-        - 支持Jinja2模板引擎进行安全的HTML渲染
-        - 自动调整页面高度和截图尺寸
-        - 包含多层回退机制，确保在各种环境下都能正常工作
-        - 支持当前用户高亮显示
-        - 提供默认模板作为备用方案
-        - 模板缓存机制，提高重复渲染效率
-        
-    Attributes:
-        config (PluginConfig): 插件配置对象，包含生成参数
-        browser (Optional[Browser]): Playwright浏览器实例
-        page (Optional[Page]): Playwright页面实例
-        playwright: Playwright实例
-        logger: 日志记录器
-        width (int): 图片宽度，默认1200像素
-        timeout (int): 页面加载超时时间，默认10秒
-        viewport_height (int): 视口高度，默认1像素
-        template_path (Path): HTML模板文件路径
-        jinja_env (Optional[Environment]): Jinja2环境对象
-        _template_cache (Dict): 模板缓存字典
-        _cache_lock (Lock): 缓存锁，确保线程安全
-        
-    Example:
-        >>> generator = ImageGenerator(config)
-        >>> await generator.initialize()
-        >>> image_path = await generator.generate_rank_image(users, group_info, "排行榜")
+    """HTML 模板生成器。
+
+    类名为兼容已有插件调用而保留；它只负责整理数据、读取模板并生成 HTML，
+    具体截图完全交由 AstrBot 的 T2I 服务处理。
     """
     
     def __init__(self, config: PluginConfig):
@@ -188,15 +146,10 @@ class ImageGenerator:
             config (PluginConfig): 插件配置对象，包含生成参数和设置
         """
         self.config = config
-        self.browser: Optional[Browser] = None
-        self.page: Optional[Page] = None
-        self.playwright = None
         self.logger = astrbot_logger
         
         # 图片生成配置
         self.width = IMAGE_WIDTH
-        self.timeout = BROWSER_TIMEOUT
-        self.viewport_height = VIEWPORT_HEIGHT
         
         # 模板路径 - 根据主题选择
         self._templates_dir = Path(__file__).parent.parent / "templates"
@@ -207,10 +160,6 @@ class ImageGenerator:
         self._cache_lock = asyncio.Lock()
         self._cache_hits = 0
         self._cache_misses = 0
-        
-        # 并发控制：浏览器的生命周期管理
-        self._browser_lock = asyncio.Lock()
-        self._active_tasks = 0
         
         # Jinja2环境将在initialize方法中初始化
         self.jinja_env = None
@@ -461,28 +410,6 @@ class ImageGenerator:
         self._font_css_cache_value = css
         return css
 
-    async def _apply_custom_font(self, page: Page):
-        css = self._get_custom_font_css()
-        if css:
-            await page.add_style_tag(content=css)
-
-    async def _wait_for_assets(self, page: Page):
-        await page.evaluate("""
-            async () => {
-                if (document.fonts && document.fonts.ready) {
-                    await document.fonts.ready;
-                }
-                const images = Array.from(document.querySelectorAll('img'));
-                await Promise.all(images.map(img => {
-                    if (img.complete) return Promise.resolve();
-                    return new Promise(resolve => {
-                        img.addEventListener('load', resolve, { once: true });
-                        img.addEventListener('error', resolve, { once: true });
-                    });
-                }));
-            }
-        """)
-
     async def _get_cached_template(self) -> Optional[Union[str, Template]]:
         """获取缓存的模板（使用模板路径区分的缓存键，确保深浅色主题独立缓存）"""
         cache_key = self._get_template_cache_key()
@@ -522,651 +449,124 @@ class ImageGenerator:
     
     @safe_generation(default_return=None)
     async def initialize(self):
-        """初始化图片生成器（轻量初始化）
-        
-        只初始化Jinja2模板环境，不启动浏览器。
-        浏览器将在首次生成图片时按需启动（懒加载）。
-        
-        Raises:
-            ImageGenerationError: 当Playwright未安装时抛出
-            
-        Returns:
-            None: 无返回值
+        """初始化本地 HTML 模板环境。
+
+        图片由 AstrBot 的 T2I 服务生成；此处不再创建浏览器进程或本地截图文件。
         """
-        if not PLAYWRIGHT_AVAILABLE:
-            self.logger.error("Playwright未安装，图片生成功能将不可用")
-            raise ImageGenerationError("Playwright未安装，无法生成图片")
-        
         try:
-            self.logger.info("开始初始化图片生成器（轻量模式）...")
-            
-            # 只初始化Jinja2环境，浏览器按需启动
             await self._init_jinja2_env()
-            
-            # 启动时清理上次异常退出残留的临时图片文件
-            await self._cleanup_stale_temp_files()
-            
-            self.logger.info("图片生成器初始化完成（浏览器未启动，将在首次生成图片时按需启动）")
-        except FileNotFoundError as e:
-            self.logger.error(f"模板文件未找到: {e}")
-            raise ImageGenerationError(f"模板文件未找到: {e}")
-        except PermissionError as e:
-            self.logger.error(f"权限错误: {e}")
-            raise ImageGenerationError(f"权限不足: {e}")
-        except OSError as e:
-            self.logger.error(f"初始化图片生成器失败: {e}")
-            self.logger.error(f"详细错误: {traceback.format_exc()}")
-            raise ImageGenerationError(f"初始化失败: {e}")
-    
-    async def _cleanup_stale_temp_files(self):
-        """清理上次异常退出残留的临时图片文件和 Playwright 临时数据目录
-        
-        当插件被 kill -9、OOM 杀死、断电等异常情况时，
-        finally 块不会执行，tmp 文件和 Playwright profiles 会残留。
-        每次初始化时扫描临时目录，清理残留文件。
-        """
-        try:
-            import glob
-            temp_dir = tempfile.gettempdir()
-            patterns = ["rank_image_*.png", "milestone_*.png"]
-            cleaned = 0
-            for pattern in patterns:
-                search_path = os.path.join(temp_dir, pattern)
-                for file_path in glob.glob(search_path):
-                    try:
-                        os.unlink(file_path)
-                        cleaned += 1
-                    except OSError:
-                        pass
-            if cleaned > 0:
-                self.logger.info(f"启动清理：已删除 {cleaned} 个上次残留的临时图片文件")
-            
-            # 清理 Playwright 残留的临时 profiles 目录和 Chromium 锁文件
-            # 进程异常退出时这些目录/文件不会被 playwright.stop() 清理
-            pw_cleaned = 0
-            for entry in os.listdir(temp_dir):
-                entry_path = os.path.join(temp_dir, entry)
-                if not entry.startswith((
-                    "playwright-", "playwright_",
-                    "msgstats_pw_",
-                    ".org.chromium.Chromium.",
-                    "org.chromium.Chromium.",
-                    "playwright-artifacts-",
-                    "playwright_chromiumdev_profile-",
-                    "pulse-",
-                )):
-                    continue
-                try:
-                    if os.path.isdir(entry_path):
-                        shutil.rmtree(entry_path, ignore_errors=True)
-                    else:
-                        os.unlink(entry_path)
-                    pw_cleaned += 1
-                except OSError:
-                    pass
-            if pw_cleaned > 0:
-                self.logger.info(f"启动清理：已删除 {pw_cleaned} 个上次残留的 Playwright 临时文件/目录")
-        except Exception as e:
-            self.logger.warning(f"清理残留临时文件时出现异常: {e}")
-    
-    async def _ensure_browser(self):
-        """确保浏览器已启动（懒加载）并增加任务计数
-        
-        使用异步锁防止并发启动。如果是第一个任务则启动浏览器，
-        然后增加活跃任务计数器。
-        如果 Chromium 浏览器未安装，自动尝试安装后重试。
-        """
-        async with self._browser_lock:
-            self._active_tasks += 1
-            if self.browser:
-                return
-            
-            self.logger.info("按需启动浏览器...")
-            error_msg = await self._try_launch_browser()
-            if error_msg is None:
-                return  # 启动成功
-            
-            # 启动失败，尝试自动安装 Chromium
-            self.logger.warning(f"Chromium 启动失败: {error_msg}")
-            self.logger.info("正在自动安装 Chromium 浏览器，可能需要 1-2 分钟...")
-            
-            install_ok = await self._auto_install_chromium()
-            if install_ok:
-                # 重试启动
-                retry_error = await self._try_launch_browser()
-                if retry_error is None:
-                    self.logger.info("Chromium 浏览器安装并启动成功")
-                    return
-            
-            # 自动安装也失败了
-            self._active_tasks -= 1
-            raise ImageGenerationError(
-                f"Chromium 浏览器未安装或缺少系统依赖。\n"
-                f"请手动运行: playwright install chromium\n"
-                f"Linux 用户可能还需要: playwright install-deps chromium\n"
-                f"原始错误: {error_msg}"
-            )
-    
-    async def _try_launch_browser(self) -> Optional[str]:
-        """尝试启动浏览器，成功返回 None，失败返回错误信息字符串"""
-        try:
-            self.playwright = await async_playwright().start()
-            self.browser = await self.playwright.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-extensions"
-                ]
-            )
-            self.logger.info("Chromium浏览器启动成功")
-            return None
-        except Exception as e:
-            return str(e)
-    
-    async def _auto_install_chromium(self) -> bool:
-        """自动安装 Chromium 浏览器，返回是否成功"""
-        try:
-            # 先尝试基本的 chromium 安装
-            self.logger.info("执行 playwright install chromium...")
-            proc = await asyncio.create_subprocess_exec(
-                "playwright", "install", "chromium",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                self.logger.error("playwright install chromium 超时（5 分钟）")
-                return False
-            if proc.returncode == 0:
-                self.logger.info("playwright install chromium 完成")
-                # 二进制装好了，补装系统依赖（无头浏览器运行需要 libnspr4.so 等库）
-                # deps 失败不影响整体结果——可能已经装过或者非 Linux 环境
-                self.logger.info("补充安装系统依赖 (playwright install-deps chromium)...")
-                try:
-                    proc_deps = await asyncio.create_subprocess_exec(
-                        "playwright", "install-deps", "chromium",
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    await asyncio.wait_for(proc_deps.communicate(), timeout=300)
-                    if proc_deps.returncode == 0:
-                        self.logger.info("系统依赖安装完成")
-                except (asyncio.TimeoutError, Exception) as e:
-                    self.logger.warning(f"系统依赖安装跳过: {e}")
-                return True
-            
-            # install chromium 失败了，可能是缺少系统依赖
-            self.logger.info("正在安装系统依赖 (playwright install-deps chromium)...")
-            proc2 = await asyncio.create_subprocess_exec(
-                "playwright", "install-deps", "chromium",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            try:
-                await asyncio.wait_for(proc2.communicate(), timeout=300)
-            except asyncio.TimeoutError:
-                proc2.kill()
-                await proc2.wait()
-                self.logger.error("playwright install-deps 超时（5 分钟）")
-                return False
-            if proc2.returncode == 0:
-                self.logger.info("系统依赖安装完成")
-                # 再试一次 install chromium
-                proc3 = await asyncio.create_subprocess_exec(
-                    "playwright", "install", "chromium",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                try:
-                    await asyncio.wait_for(proc3.communicate(), timeout=300)
-                except asyncio.TimeoutError:
-                    proc3.kill()
-                    await proc3.wait()
-                    self.logger.error("playwright install chromium 重试超时（5 分钟）")
-                    return False
-                if proc3.returncode == 0:
-                    return True
-            
-            self.logger.error("自动安装 Chromium 失败")
-            return False
-        except FileNotFoundError:
-            self.logger.error("找不到 playwright 命令，请确保已安装 playwright 包")
-            return False
-        except Exception as e:
-            self.logger.error(f"自动安装 Chromium 异常: {e}")
-            return False
-    
-    async def _close_browser(self):
-        """任务完成，减少任务计数，如果计数为0则关闭浏览器释放内存"""
-        # 防止取消异常打断清理流程导致任务数泄漏
-        import asyncio
-        try:
-            async with self._browser_lock:
-                self._active_tasks = max(0, self._active_tasks - 1)
-                
-                if self._active_tasks > 0:
-                    # 还有其他任务在使用浏览器，不关闭
-                    return
-                    
-                try:
-                    # 不再在此处关闭self.page，因为页面已变为局部变量，由各自的任务自行关闭
-                    if self.browser:
-                        await self.browser.close()
-                        self.browser = None
-                    if self.playwright:
-                        await self.playwright.stop()
-                        self.playwright = None
-                    self.logger.info("所有渲染任务完成，浏览器已关闭并释放内存")
-                except Exception as e:
-                    self.logger.warning(f"关闭浏览器时发生错误: {e}")
-                finally:
-                    self.browser = None
-                    self.playwright = None
-        except asyncio.CancelledError:
-            # 如果清理过程被取消，我们至少要把任务计数减一，以防止死锁和内存泄漏
-            self._active_tasks = max(0, self._active_tasks - 1)
-            if self._active_tasks == 0:
-                self.browser = None
-                self.playwright = None
-            raise
-    
+            self.logger.info("HTML 模板生成器初始化完成，将使用 AstrBot T2I 渲染")
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            self.logger.error(f"初始化 HTML 模板生成器失败: {exc}")
+            raise ImageGenerationError(f"初始化失败: {exc}") from exc
+
     async def cleanup(self):
-        """清理资源
-        
-        异步清理图片生成器的所有资源，包括浏览器实例、页面和Playwright对象。
-        确保资源正确释放，避免内存泄漏。
-        
-        Raises:
-            Exception: 当清理过程中发生错误时抛出
-            
-        Returns:
-            None: 无返回值，清理完成后所有资源将被释放
-            
-        Example:
-            >>> await generator.cleanup()
-            >>> print(generator.browser is None)
-            True
-        """
-        try:
-            if self.page:
-                await self.page.close()
-                self.page = None
-            
-            if self.browser:
-                await self.browser.close()
-                self.browser = None
-            
-            if self.playwright:
-                await self.playwright.stop()
-                self.playwright = None
-            
-            self.logger.info("图片生成器资源已清理")
-        
-        except ConnectionError as e:
-            self.logger.error(f"浏览器连接错误: {e}")
-        except Exception as e:
-            self.logger.error(f"清理图片生成器资源失败: {e}")
+        """清理模板与头像缓存，不持有浏览器或本地图片资源。"""
+        self._avatar_cache.clear()
+        await self.clear_cache()
+        self.logger.info("HTML 模板生成器资源已清理")
     
-    @safe_generation(default_return=None)
-    async def generate_rank_image(self, 
-                                 users: List[UserData], 
-                                 group_info: GroupInfo, 
-                                 title: str,
-                                 current_user_id: Optional[str] = None,
-                                 llm_token_usage: Dict[str, int] = None,
-                                 titles_map: Optional[Dict[str, str]] = None) -> str:
-        """生成排行榜图片（懒加载浏览器，用完即关）
-        
-        Args:
-            users: 用户数据列表（已按发言数降序排列）
-            group_info: 群组信息
-            title: 排行榜标题
-            current_user_id: 当前用户ID，用于高亮显示
-            llm_token_usage: LLM token使用统计
-            titles_map: 用户ID到头衔的映射字典 {user_id: title}
-            
-        Returns:
-            str: 生成的临时图片路径
-            
-        Raises:
-            ImageGenerationError: 图片生成失败时抛出
-        """
-        # 每次生成图片时重新检查主题（支持自动主题切换实时生效）
+    @safe_generation(default_return="")
+    async def generate_rank_html(
+        self,
+        users: List[UserData],
+        group_info: GroupInfo,
+        title: str,
+        current_user_id: Optional[str] = None,
+        llm_token_usage: Optional[Dict[str, int]] = None,
+        titles_map: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """生成排行榜 HTML，供调用方交给 AstrBot T2I 截图。"""
         self._update_template_path()
-        
-        # 按需启动浏览器
-        await self._ensure_browser()
-        
-        temp_path = None
-        page = None
-        success = False
-        
-        try:
-            # 创建局部页面变量，防止并发时互相覆盖（开启两倍高清渲染）
-            page = await self.browser.new_page(device_scale_factor=2)
-            
-            # 设置视口
-            await page.set_viewport_size({"width": self.width, "height": self.viewport_height})
-            
-            # 生成HTML内容（显式传入头衔映射）
-            html_content = await self._generate_html(users, group_info, title, current_user_id, llm_token_usage, titles_map)
-            
-            # 动态获取内容实际所需的宽度，如果没生成则默认1200
-            dynamic_w = self.width
-            if "area_w" in html_content: # 这只是个保守预设，下面直接用 JS 测
-                pass
-                
-            # 设置页面内容（使用 load 而非 networkidle，避免外部资源加载超时）
-            await page.set_content(html_content, wait_until="load")
-            await self._apply_custom_font(page)
-            await self._wait_for_assets(page)
+        return await self._generate_html(
+            users,
+            group_info,
+            title,
+            current_user_id,
+            llm_token_usage,
+            titles_map,
+        )
 
-            # 动态调整页面高度和宽度，确保边距一致
-            body_height = await page.evaluate("document.body.scrollHeight")
-            # 通过获取 container 的宽度加上两侧 padding 来确定精确的截图宽度
-            body_width = await page.evaluate("document.querySelector('.container') ? document.querySelector('.container').offsetWidth + 100 : document.body.scrollWidth")
-            await page.set_viewport_size({"width": body_width, "height": body_height})
-            
-            # 生成临时文件路径（异步方式）
-            temp_filename = f"rank_image_{uuid.uuid4().hex}.png"
-            temp_path = Path(tempfile.gettempdir()) / temp_filename
-            
-            # 截图
-            await page.screenshot(path=temp_path, full_page=True)
-            
-            success = True
-            return str(temp_path)
+    @safe_generation(default_return="")
+    async def generate_personal_stats_html(self, data: dict, group_info: GroupInfo) -> str:
+        """生成个人统计卡片 HTML，使用固定的 480px T2I 画布。"""
+        theme = getattr(self.config, "theme", "default")
+        if getattr(self.config, "auto_theme_switch", False):
+            theme = self._get_auto_theme(theme)
+        personal_template_map = {
+            "default": "personal_stats.html",
+            "cartoon_light": "personal_stats_cartoon_light.html",
+            "cartoon_dark": "personal_stats_cartoon_dark.html",
+            "liquid_glass": "personal_stats.html",
+            "liquid_glass_dark": "personal_stats.html",
+        }
+        template_path = self._templates_dir / personal_template_map.get(theme, "personal_stats.html")
+        if not template_path.is_file():
+            raise ImageGenerationError(f"个人卡片模板文件不存在: {template_path}")
 
-        
-        except FileNotFoundError as e:
-            self.logger.error(f"临时文件或资源未找到: {e}")
-            raise ImageGenerationError(f"文件资源未找到: {e}")
-        except PermissionError as e:
-            self.logger.error(f"权限错误: {e}")
-            raise ImageGenerationError(f"权限不足: {e}")
-        except TimeoutError as e:
-            self.logger.error(f"浏览器操作超时: {e}")
-            raise ImageGenerationError(f"操作超时: {e}")
-        except RuntimeError as e:
-            # 捕获浏览器运行时错误，如页面渲染失败、JavaScript执行错误等
-            self.logger.error(f"生成排行榜图片失败: {e}")
-            self.logger.error(f"详细错误: {traceback.format_exc()}")
-            raise ImageGenerationError(f"生成图片失败: {e}")
-        
-        finally:
-            # 清理资源
-            if page:
-                try:
-                    await page.close()
-                except Exception as e:
-                    self.logger.warning(f"关闭页面时发生错误: {e}")
-            
-            # 生成完毕后关闭浏览器释放内存
-            await self._close_browser()
-            
-            # 清理临时文件：如果生成失败，删除已创建的临时文件避免积累
-            if not success and temp_path and temp_path.exists():
-                try:
-                    os.unlink(str(temp_path))
-                    self.logger.debug(f"已清理失败的临时文件: {temp_path}")
-                except Exception as e:
-                    self.logger.warning(f"清理临时文件失败: {e}")
-    
-    @safe_generation(default_return=None)
-    async def generate_personal_stats_image(self, data: dict, group_info: GroupInfo) -> str:
-        """生成个人资料卡片图片
-        
-        Args:
-            data: 用户数据字典
-            group_info: 群组信息
-            
-        Returns:
-            str: 生成的图片路径，失败时返回None
-        """
-        # 按需启动浏览器
-        await self._ensure_browser()
-        
-        page = None
-        temp_path = None
-        success = False
-        try:
-            # 个人卡片使用 480 宽
-            page = await self.browser.new_page(device_scale_factor=2)
-            await page.set_viewport_size({"width": 480, "height": self.viewport_height})
-            
-            # 检测当前主题并选择对应模板
-            theme = getattr(self.config, 'theme', 'default')
-            auto_switch = getattr(self.config, 'auto_theme_switch', False)
-            if auto_switch:
-                theme = self._get_auto_theme(theme)
-            is_dark = theme.endswith('_dark')
-            
-            # 根据主题选择个人面板模板
-            personal_template_map = {
-                'default': 'personal_stats.html',
-                'cartoon_light': 'personal_stats_cartoon_light.html',
-                'cartoon_dark': 'personal_stats_cartoon_dark.html',
-                'liquid_glass': 'personal_stats.html',
-                'liquid_glass_dark': 'personal_stats.html',
-            }
-            template_file = personal_template_map.get(theme, 'personal_stats.html')
-            template_path = self._templates_dir / template_file
-            if not os.path.exists(template_path):
-                self.logger.warning(f"个人卡片模板文件不存在: {template_path}")
-                return None
-            data['is_dark'] = is_dark
-            data['custom_font_css'] = self._get_custom_font_css()
-            data['current_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # 异步读取模板文件（与里程碑模板渲染方式一致，避免 Jinja2 缺少 FileSystemLoader 的问题）
-            async with aiofiles.open(template_path, 'r', encoding='utf-8') as f:
-                template_content = await f.read()
-            if JINJA2_AVAILABLE and self.jinja_env:
-                template_obj = self.jinja_env.from_string(template_content)
-                html_content = template_obj.render(data=data)
-            else:
-                html_content = template_content
-                # 简易替换 Jinja2 占位符
-                import re
-                def replace_placeholder(m):
-                    key = m.group(1).strip()
-                    keys = key.split('.')
-                    val = data
-                    for k in keys:
-                        if isinstance(val, dict):
-                            val = val.get(k, "")
-                        else:
-                            val = ""
-                            break
-                    return str(val)
-                html_content = re.sub(r'\{\{[^}]+\}\}', replace_placeholder, html_content)
-            
-            # 将HTML内容设置到页面
-            await page.set_content(html_content, wait_until='networkidle')
-            await self._apply_custom_font(page)
-            await self._wait_for_assets(page)
+        template_data = dict(data)
+        template_data["is_dark"] = theme.endswith("_dark")
+        template_data["custom_font_css"] = self._get_custom_font_css()
+        template_data["current_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        async with aiofiles.open(template_path, "r", encoding="utf-8") as template_file:
+            template_content = await template_file.read()
+        if JINJA2_AVAILABLE and self.jinja_env:
+            return self.jinja_env.from_string(template_content).render(data=template_data)
 
-            # 动态调整高度以适应内容，但不小于最小高度
-            height = await page.evaluate("() => document.getElementById('inspect-root') ? document.getElementById('inspect-root').offsetHeight : document.body.scrollHeight")
-            await page.set_viewport_size({"width": 480, "height": int(height)})
-            
-            # 生成临时文件路径
-            fd, temp_path = tempfile.mkstemp(suffix='.png', prefix='personal_stats_')
-            os.close(fd)
-            
-            # 截图
-            await page.screenshot(
-                path=temp_path,
-                full_page=True,
-                type='png'
-            )
-            
-            success = True
-            return temp_path
-            
-        except Exception as e:
-            self.logger.exception(f"生成个人卡片异常: {e}")
-            return None
-        finally:
-            if page:
-                try:
-                    await page.close()
-                except Exception as e:
-                    self.logger.debug(f"关闭页面失败: {e}")
-            if not success and temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except Exception:
-                    pass
+        for key, value in template_data.items():
+            template_content = template_content.replace(f"{{{{ data.{key} }}}}", str(value))
+            template_content = template_content.replace(f"{{{{data.{key}}}}}", str(value))
+        return template_content
 
-    @safe_generation(default_return=None)
-    async def generate_milestone_image(self,
-                                       user_id: str,
-                                       nickname: str,
-                                       milestone_count: int,
-                                       rank: int,
-                                       daily_count: int,
-                                       active_days: int,
-                                       last_date: str,
-                                       group_total_messages: int,
-                                       percentage: float,
-                                       group_info: GroupInfo) -> str:
-        """生成里程碑个人成就卡片图片
-        
-        生成一张精美的个人成就卡片，替代里程碑触发时发送整个排行榜。
-        
-        Args:
-            user_id: 用户ID
-            nickname: 用户昵称
-            milestone_count: 里程碑发言次数
-            rank: 群内排名
-            daily_count: 今日发言数
-            active_days: 活跃天数
-            last_date: 最后发言日期
-            group_total_messages: 群总发言数
-            percentage: 击败的活跃群友百分比
-            group_info: 群组信息
-            
-        Returns:
-            str: 生成的图片路径，失败时返回None
-        """
-        # 按需启动浏览器
-        await self._ensure_browser()
-        
-        page = None
-        temp_path = None
-        success = False
-        try:
-            # 创建局部页面变量（里程碑卡片使用较窄的视口，开启两倍高清渲染）
-            page = await self.browser.new_page(device_scale_factor=2)
-            milestone_width = 600
-            await page.set_viewport_size({"width": milestone_width, "height": self.viewport_height})
-            
-            # 加载里程碑模板
-            milestone_template_path = self._templates_dir / "milestone_template.html"
-            template_content = ""
-            if os.path.exists(milestone_template_path):
-                async with aiofiles.open(milestone_template_path, 'r', encoding='utf-8') as f:
-                    template_content = await f.read()
-            else:
-                self.logger.warning(f"里程碑模板文件不存在: {milestone_template_path}")
-                return None
-            
-            # 准备模板数据
-            avatar_url = self._get_avatar_url(user_id, nickname, group_info)
-            group_name = self._get_display_group_name(group_info)
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            template_data = {
-                'avatar_url': avatar_url,
-                'nickname': self._escape_html_safe(nickname),
-                'user_id': self._escape_html_safe(str(user_id)),
-                'group_name': self._escape_html_safe(
-                    f"{group_name}[{group_info.group_id}]"
-                    if not is_official_qq_openid(group_info.group_id)
-                    else group_name
-                ),
-            'show_group_id': not is_official_qq_openid(group_info.group_id),
-                'milestone_count': milestone_count,
-                'rank': rank,
-                'daily_count': daily_count,
-                'active_days': active_days,
-                'last_date': self._escape_html_safe(last_date or "未知"),
-                'group_total_messages': group_total_messages,
-                'percentage': f"{percentage:.2f}",
-                'current_time': current_time,
-                'custom_font_css': self._get_custom_font_css(),
-            }
-            
-            # 渲染模板
-            if JINJA2_AVAILABLE and self.jinja_env:
-                template = self.jinja_env.from_string(template_content)
-                html_content = template.render(**template_data)
-            else:
-                # 回退：简单占位符替换
-                html_content = template_content
-                for key, value in template_data.items():
-                    html_content = html_content.replace('{{ ' + key + ' }}', str(value))
-                    html_content = html_content.replace('{{' + key + '}}', str(value))
-            
-            # 设置页面内容
-            await page.set_content(html_content, wait_until="load")
-            await self._apply_custom_font(page)
-            await self._wait_for_assets(page)
+    @safe_generation(default_return="")
+    async def generate_milestone_html(
+        self,
+        user_id: str,
+        nickname: str,
+        milestone_count: int,
+        rank: int,
+        daily_count: int,
+        active_days: int,
+        last_date: str,
+        group_total_messages: int,
+        percentage: float,
+        group_info: GroupInfo,
+    ) -> str:
+        """生成里程碑卡片 HTML，使用固定的 600px T2I 画布。"""
+        template_path = self._templates_dir / "milestone_template.html"
+        if not template_path.is_file():
+            raise ImageGenerationError(f"里程碑模板文件不存在: {template_path}")
+        async with aiofiles.open(template_path, "r", encoding="utf-8") as template_file:
+            template_content = await template_file.read()
 
-            # 动态调整页面高度
-            body_height = await page.evaluate("document.body.scrollHeight")
-            await page.set_viewport_size({"width": milestone_width, "height": body_height})
-            
-            # 生成临时文件
-            temp_filename = f"milestone_{uuid.uuid4().hex}.png"
-            temp_path = Path(tempfile.gettempdir()) / temp_filename
-            
-            # 截图
-            await page.screenshot(path=temp_path, full_page=True)
-            
-            success = True
-            return str(temp_path)
-        
-        except FileNotFoundError as e:
-            self.logger.error(f"里程碑模板文件未找到: {e}")
-            raise ImageGenerationError(f"文件资源未找到: {e}")
-        except PermissionError as e:
-            self.logger.error(f"权限错误: {e}")
-            raise ImageGenerationError(f"权限不足: {e}")
-        except TimeoutError as e:
-            self.logger.error(f"浏览器操作超时: {e}")
-            raise ImageGenerationError(f"操作超时: {e}")
-        except RuntimeError as e:
-            self.logger.error(f"生成里程碑卡片失败: {e}")
-            self.logger.error(f"详细错误: {traceback.format_exc()}")
-            raise ImageGenerationError(f"生成图片失败: {e}")
-        
-        finally:
-            if page:
-                try:
-                    await page.close()
-                except Exception as e:
-                    self.logger.warning(f"关闭页面时发生错误: {e}")
-            
-            # 生成完毕后关闭浏览器释放内存
-            await self._close_browser()
-            
-            # 清理临时文件：如果生成失败，删除已创建的临时文件避免积累
-            if not success and temp_path and temp_path.exists():
-                try:
-                    os.unlink(str(temp_path))
-                    self.logger.debug(f"已清理失败的里程碑临时文件: {temp_path}")
-                except Exception as e:
-                    self.logger.warning(f"清理里程碑临时文件失败: {e}")
+        group_name = self._get_display_group_name(group_info)
+        template_data = {
+            "avatar_url": self._get_avatar_url(user_id, nickname, group_info),
+            "nickname": self._escape_html_safe(nickname),
+            "user_id": self._escape_html_safe(str(user_id)),
+            "group_name": self._escape_html_safe(
+                f"{group_name}[{group_info.group_id}]"
+                if not is_official_qq_openid(group_info.group_id)
+                else group_name
+            ),
+            "show_group_id": not is_official_qq_openid(group_info.group_id),
+            "milestone_count": milestone_count,
+            "rank": rank,
+            "daily_count": daily_count,
+            "active_days": active_days,
+            "last_date": self._escape_html_safe(last_date or "未知"),
+            "group_total_messages": group_total_messages,
+            "percentage": f"{percentage:.2f}",
+            "current_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "custom_font_css": self._get_custom_font_css(),
+        }
+        if JINJA2_AVAILABLE and self.jinja_env:
+            return self.jinja_env.from_string(template_content).render(**template_data)
+
+        for key, value in template_data.items():
+            template_content = template_content.replace(f"{{{{ {key} }}}}", str(value))
+            template_content = template_content.replace(f"{{{{{key}}}}}", str(value))
+        return template_content
     
     @safe_generation(default_return="")
     async def _generate_html(self, 
@@ -1498,7 +898,6 @@ class ImageGenerator:
         safe_avatar_url = html.escape(safe_content['avatar_url'])
         safe_last_date = html.escape(safe_content['last_date'])
         safe_separator_style = html.escape(styles['separator'])
-        safe_rank_color = html.escape(styles['rank_color'])
         safe_avatar_border = html.escape(styles['avatar_border'])
         
         # 根据当前用户状态选择合适的排名样式类
@@ -2263,62 +1662,6 @@ class ImageGenerator:
         
         return default_template
     
-    async def test_browser_connection(self) -> bool:
-        """测试浏览器连接（懒加载，用完即关）"""
-        try:
-            await self._ensure_browser()
-            
-            # 创建一个测试页面
-            test_page = await self.browser.new_page()
-            
-            # 设置基本内容
-            await test_page.set_content("<html><body><h1>Test</h1></body></html>")
-            
-            # 验证页面可以正常加载
-            title = await test_page.title()
-            
-            await test_page.close()
-            
-            return title == "Test"
-        
-        except FileNotFoundError as e:
-            self.logger.error(f"浏览器可执行文件未找到: {e}")
-            return False
-        except PermissionError as e:
-            self.logger.error(f"测试浏览器连接权限不足: {e}")
-            return False
-        except ConnectionError as e:
-            self.logger.error(f"浏览器连接失败: {e}")
-            return False
-        except RuntimeError as e:
-            # 捕获浏览器运行时错误，如页面操作失败、JavaScript执行错误等
-            self.logger.error(f"测试浏览器连接失败: {e}")
-            return False
-        finally:
-            await self._close_browser()
-    
-    async def get_browser_info(self) -> Dict[str, Any]:
-        """获取浏览器信息"""
-        try:
-            if not self.browser:
-                return {"status": "not_initialized"}
-            
-            return {
-                "status": "ready",
-                "user_agent": await self.browser.user_agent(),
-                "viewport": {"width": self.width, "height": self.viewport_height}
-            }
-        
-        except FileNotFoundError as e:
-            return {"status": "error", "error": f"浏览器文件未找到: {e}"}
-        except PermissionError as e:
-            return {"status": "error", "error": f"权限不足: {e}"}
-        except ConnectionError as e:
-            return {"status": "error", "error": f"连接失败: {e}"}
-        except RuntimeError as e:
-            # 捕获浏览器信息获取时的运行时错误，如页面操作失败、资源访问错误等
-            return {"status": "error", "error": str(e)}
-    
     async def clear_cache(self):
         """清理模板缓存"""
         async with self._cache_lock:
@@ -2333,7 +1676,6 @@ class ImageGenerator:
             'cache_stats': cache_stats,
             'cached_templates': list(self._template_cache.keys()),
             'jinja2_enabled': JINJA2_AVAILABLE and self.jinja_env is not None,
-            'playwright_enabled': PLAYWRIGHT_AVAILABLE,
             'template_path': str(self.template_path),
             'template_exists': os.path.exists(self.template_path) if self.template_path else False
         }
@@ -2366,4 +1708,3 @@ class ImageGenerator:
             self.logger.warning(f"加载用户条目宏模板失败: {e}")
         
         return None
-

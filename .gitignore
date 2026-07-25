@@ -16,3 +16,4 @@ env/
 Thumbs.db
 
 tests/*
+!tests/test_t2i_renderer.py

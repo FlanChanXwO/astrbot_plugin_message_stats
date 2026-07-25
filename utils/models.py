@@ -504,7 +504,8 @@ class PluginConfig:
         self.is_admin_restricted = 0
         self.rand = 20
         self.if_send_pic = 1
-        self.render_mode = "playwright"  # 渲染方式: playwright / t2i / text
+        self.render_mode = "t2i"  # 渲染方式: t2i / text
+        self.t2i_endpoint = ""  # 留空时继承 AstrBot 全局 t2i_endpoint
         self.detailed_logging_enabled = True  # 默认开启详细日志，便于调试
         
         # 定时功能配置
@@ -678,7 +679,10 @@ class PluginConfig:
         config.is_admin_restricted = data.get("is_admin_restricted", 0)
         config.rand = data.get("rand", 20)
         config.if_send_pic = if_send_pic
-        config.render_mode = str(data.get("render_mode", config.render_mode))
+        render_mode = str(data.get("render_mode", config.render_mode)).strip().lower()
+        # 旧配置的 playwright 选项统一迁移到 T2I，避免升级后再尝试启动本地浏览器。
+        config.render_mode = render_mode if render_mode in {"t2i", "text"} else "t2i"
+        config.t2i_endpoint = str(data.get("t2i_endpoint", "") or "").strip()
         config.detailed_logging_enabled = data.get("detailed_logging_enabled", True)
         timer_tasks_raw = data.get("timer_tasks", [])
         if isinstance(timer_tasks_raw, list):

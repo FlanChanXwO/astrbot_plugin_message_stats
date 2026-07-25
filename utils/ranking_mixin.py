@@ -1,13 +1,9 @@
 """排行榜数据准备、输出调度、文字格式化和 T2I 能力。"""
 
 import asyncio
-import base64
-import os
 import re
-import tempfile
 from datetime import date, datetime, timedelta
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from astrbot.api.event import AstrMessageEvent
 
@@ -17,6 +13,7 @@ from .llm_analyzer import LLMAnalyzer
 from .models import GroupInfo, PluginConfig, RankType, UserData
 from .platform_helper import PlatformHelper
 from .group_id_utils import get_fallback_group_name, is_placeholder_group_name
+from .t2i_renderer import T2IRenderError, get_container_width, render_html
 
 
 CUSTOM_RANK_DATE_TOKEN = r"\d{4}年\d{1,2}月\d{1,2}日"
@@ -175,12 +172,12 @@ class RankingMixin:
                     self.logger.error(f"❌ 手动LLM头衔生成异常: {e}", exc_info=True)
 
             # 根据配置选择渲染模式
-            render_mode = getattr(config, 'render_mode', 'playwright')
+            render_mode = getattr(config, 'render_mode', 't2i')
             if render_mode == 'text':
                 async for result in self._render_rank_as_text(event, filtered_data, group_info, title, config):
                     yield result
             else:
-                # playwright 或 t2i 都走图片渲染（playwright 失败自动降级 t2i）
+                # 图片模式统一通过 AstrBot T2I 服务渲染。
                 async for result in self._render_rank_as_image(event, filtered_data, group_info, title, current_user_id, config, token_usage_info, titles_map):
                     yield result
 
@@ -375,18 +372,11 @@ class RankingMixin:
                                   group_info: GroupInfo, title: str, current_user_id: str, config: PluginConfig,
                                   llm_token_usage: Dict[str, int] = None,
                                   titles_map: Optional[Dict[str, str]] = None):
-        """渲染排行榜为图片模式"""
-        temp_path = None
+        """使用 AstrBot T2I 渲染排行榜，不再启动本地浏览器。"""
         try:
-            # 提取用户数据用于图片生成，并应用人数限制
-            # 先限制数量，再提取用户数据
             limited_data = filtered_data[:config.rand]
             users_for_image = []
-
-            # 为用户数据设置display_total属性，确保图片生成器使用正确的数据
-            # 修复：直接命令版排行榜图片显示错误数据的问题
             for user_data, count in limited_data:
-                # 设置display_total属性（时间段内的发言数）
                 user_data.display_total = count
                 users_for_image.append(user_data)
 
@@ -395,282 +385,24 @@ class RankingMixin:
                 yield event.plain_result(text_msg)
                 return
 
-            # 图片渲染（playwright / t2i 双向试探）
-            temp_path = None
-            try:
-                render_mode = getattr(config, 'render_mode', 'playwright')
-                if render_mode == 't2i':
-                    temp_path = await self._try_t2i_render(users_for_image, group_info, title, current_user_id, llm_token_usage, titles_map)
-                    if not temp_path:
-                        yield event.plain_result("⚠️ t2i 渲染失败，正在尝试 Playwright...")
-                        temp_path = await self._try_playwright_render(users_for_image, group_info, title, current_user_id, llm_token_usage, titles_map)
-                else:
-                    temp_path = await self._try_playwright_render(users_for_image, group_info, title, current_user_id, llm_token_usage, titles_map)
-                    if not temp_path:
-                        yield event.plain_result("⚠️ Playwright 渲染失败，正在尝试 t2i...")
-                        temp_path = await self._try_t2i_render(users_for_image, group_info, title, current_user_id, llm_token_usage, titles_map)
-
-                if not temp_path:
-                    raise ImageGenerationError("Playwright 和 t2i 均渲染失败")
-            except ImageGenerationError:
-                raise
-
-
-            # 检查图片路径是否存在（t2i 返回 URL，playwright 返回本地路径）
-            if temp_path and (str(temp_path).startswith('http') or os.path.exists(temp_path)):
-                yield event.image_result(str(temp_path))
-                if os.path.exists(temp_path):
-                    self._schedule_file_cleanup(str(temp_path))
-            else:
-                # 回退到文字模式
-                text_msg = self._generate_text_message(filtered_data, group_info, title, config)
-                yield event.plain_result(text_msg)
-
-        except ImageGenerationError as e:
-            self.logger.error(f"图片渲染失败（Playwright/t2i 均不可用）: {e}")
-            # 最终降级文字
-            text_msg = self._generate_text_message(filtered_data, group_info, title, config)
-            yield event.plain_result(f"⚠️ 图片渲染失败，已自动切换为文字模式\n\n{text_msg}")
-        except (IOError, OSError, FileNotFoundError) as e:
-            self.logger.error(f"生成图片失败: {e}")
-            # 回退到文字模式
-            text_msg = self._generate_text_message(filtered_data, group_info, title, config)
-            yield event.plain_result(text_msg)
-        except ImportError as e:
-            self.logger.error(f"图片渲染失败(导入错误): {e}")
-            # 回退到文字模式
-            text_msg = self._generate_text_message(filtered_data, group_info, title, config)
-            yield event.plain_result(text_msg)
-        except RuntimeError as e:
-            self.logger.error(f"图片渲染失败(运行时错误): {e}")
-            # 回退到文字模式
-            text_msg = self._generate_text_message(filtered_data, group_info, title, config)
-            yield event.plain_result(text_msg)
-        except ValueError as e:
-            self.logger.error(f"图片渲染失败(数据格式错误): {e}")
-            # 回退到文字模式
-            text_msg = self._generate_text_message(filtered_data, group_info, title, config)
-            yield event.plain_result(text_msg)
-        except AttributeError as e:
-            self.logger.error(f"图片渲染失败(生成器未初始化): {e}")
-            text_msg = self._generate_text_message(filtered_data, group_info, title, config)
-            yield event.plain_result(text_msg)
-        finally:
-            pass
-
-    async def _try_playwright_render(self, users_for_image, group_info, title, current_user_id, llm_token_usage, titles_map):
-        """尝试 playwright 渲染，成功返回路径，失败返回 None"""
-        try:
-            return await self.image_generator.generate_rank_image(
-                users_for_image, group_info, title, current_user_id, llm_token_usage, titles_map
+            html_content = await self.image_generator.generate_rank_html(
+                users_for_image,
+                group_info,
+                title,
+                current_user_id,
+                llm_token_usage,
+                titles_map,
             )
-        except ImageGenerationError as e:
-            self.logger.warning(f"Playwright 渲染失败: {e}")
-            return None
-
-    async def _try_t2i_render(self, users_for_image, group_info, title, current_user_id, llm_token_usage, titles_map):
-        """尝试官方 t2i 渲染，按浏览器内容宽度返回本地图片路径。"""
-        try:
-            html_content = await self.image_generator._generate_html(
-                users_for_image, group_info, title, current_user_id, llm_token_usage, titles_map
+            image_url = await render_html(
+                self._get_t2i_endpoint(),
+                html_content,
+                get_container_width(html_content, self.image_generator.width),
             )
-            target_width = self._get_t2i_target_width(html_content)
-            t2i_html = self._prepare_t2i_html(html_content, target_width)
-
-            for options in self._t2i_render_options():
-                try:
-                    render_result = await self.html_render(
-                        t2i_html,
-                        {},
-                        return_url=False,
-                        options=options,
-                    )
-                    image_path = self._store_t2i_render_result(
-                        render_result,
-                        target_width,
-                    )
-                    if image_path:
-                        return image_path
-                    self.logger.warning(
-                        f"t2i 返回了无效图片，尝试下一渲染策略: {options}"
-                    )
-                except Exception as e:
-                    self.logger.warning(
-                        f"t2i 渲染策略失败: {type(e).__name__}: {e}"
-                    )
-            return None
-        except Exception as e:
-            self.logger.warning(f"t2i 渲染失败: {e}")
-            return None
-
-    @staticmethod
-    def _t2i_render_options() -> List[Dict[str, Any]]:
-        """返回兼容 AstrBot 本地/远程服务的截图策略。"""
-        return [
-            {
-                "full_page": True,
-                "type": "png",
-                "animations": "disabled",
-                "scale": "css",
-                "timeout": 50_000,
-            },
-            {
-                "full_page": True,
-                "type": "jpeg",
-                "quality": 80,
-                "animations": "disabled",
-                "scale": "css",
-                "timeout": 100_000,
-            },
-        ]
-
-    @staticmethod
-    def _get_t2i_target_width(html_content: str) -> int:
-        """复用 Playwright 的 container 宽度加 100px 画布规则。"""
-        match = re.search(
-            r"\.container\s*\{[^{}]*?max-width\s*:\s*(\d+)px",
-            html_content,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if not match:
-            return 1200
-        return max(320, min(1200, int(match.group(1)) + 100))
-
-    @staticmethod
-    def _prepare_t2i_html(html_content: str, target_width: int) -> str:
-        """固定 CSS 排版画布，图片本身仍由内容自然决定高度。"""
-        canvas_style = f"""
-<style id="message-stats-t2i-canvas">
-  html, body {{
-    width: {target_width}px !important;
-    min-width: {target_width}px !important;
-    max-width: {target_width}px !important;
-  }}
-  body {{
-    min-height: 0 !important;
-    overflow-x: hidden !important;
-  }}
-</style>
-"""
-        if "</head>" in html_content:
-            return html_content.replace("</head>", f"{canvas_style}</head>", 1)
-        return f"{canvas_style}{html_content}"
-
-    def _store_t2i_render_result(
-        self,
-        render_result: Any,
-        target_width: int,
-    ) -> Optional[str]:
-        """保存并裁切 AstrBot T2I 返回的 bytes/base64/文件结果。"""
-        if isinstance(render_result, (bytes, bytearray)):
-            return self._store_t2i_image_bytes(
-                bytes(render_result),
-                target_width,
-            )
-
-        text = str(render_result or "").strip()
-        if not text or text.startswith("<"):
-            return None
-        if text.startswith("base64://"):
-            try:
-                data = base64.b64decode(text.removeprefix("base64://"))
-            except Exception as e:
-                self.logger.warning(f"解析 t2i base64 图片失败: {e}")
-                return None
-            return self._store_t2i_image_bytes(data, target_width)
-        if text.lower().startswith("data:image/"):
-            try:
-                _, payload = text.split(",", 1)
-                data = base64.b64decode(payload)
-            except Exception as e:
-                self.logger.warning(f"解析 t2i data-uri 图片失败: {e}")
-                return None
-            return self._store_t2i_image_bytes(data, target_width)
-        if text.startswith(("http://", "https://")):
-            self.logger.warning(
-                "t2i 在 return_url=False 时仍返回 URL，无法执行本地画布裁切"
-            )
-            return text
-
-        image_path = Path(text)
-        if not image_path.is_file():
-            return None
-        try:
-            header = image_path.read_bytes()[:16]
-        except OSError:
-            return None
-        if not self._t2i_image_suffix(header):
-            return None
-        if not self._trim_t2i_canvas(image_path, target_width):
-            return None
-        return str(image_path)
-
-    def _store_t2i_image_bytes(
-        self,
-        data: bytes,
-        target_width: int,
-    ) -> Optional[str]:
-        suffix = self._t2i_image_suffix(data)
-        if not suffix:
-            return None
-        try:
-            with tempfile.NamedTemporaryFile(
-                prefix="message_stats_t2i_",
-                suffix=suffix,
-                delete=False,
-            ) as image_file:
-                image_file.write(data)
-                image_path = Path(image_file.name)
-            if not self._trim_t2i_canvas(image_path, target_width):
-                image_path.unlink(missing_ok=True)
-                return None
-            return str(image_path)
-        except OSError as e:
-            self.logger.warning(f"保存 t2i 图片失败: {e}")
-            return None
-
-    @staticmethod
-    def _t2i_image_suffix(data: bytes) -> str:
-        if data.startswith(b"\x89PNG\r\n\x1a\n"):
-            return ".png"
-        if data.startswith(b"\xff\xd8"):
-            return ".jpg"
-        if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
-            return ".webp"
-        return ""
-
-    def _trim_t2i_canvas(self, image_path: Path, target_width: int) -> bool:
-        """仅移除默认 T2I 视口右侧区域，保留浏览器自然内容高度。"""
-        try:
-            from PIL import Image
-
-            with Image.open(image_path) as image:
-                if image.width <= target_width or target_width <= 0:
-                    image.load()
-                    return True
-                cropped = image.crop((0, 0, target_width, image.height))
-                suffix = image_path.suffix.lower()
-                if suffix in {".jpg", ".jpeg"}:
-                    cropped.convert("RGB").save(
-                        image_path,
-                        format="JPEG",
-                        quality=92,
-                        optimize=True,
-                    )
-                elif suffix == ".webp":
-                    cropped.save(
-                        image_path,
-                        format="WEBP",
-                        quality=92,
-                    )
-                else:
-                    cropped.save(image_path, format="PNG")
-            return True
-        except Exception as e:
-            self.logger.debug(
-                f"t2i 图片校验或画布裁切失败: {type(e).__name__}: {e}"
-            )
-            return False
+            yield event.image_result(image_url)
+        except (ImageGenerationError, T2IRenderError, OSError, ValueError) as exc:
+            self.logger.error(f"排行榜 T2I 渲染失败: {exc}")
+            text_msg = self._generate_text_message(filtered_data, group_info, title, config)
+            yield event.plain_result(f"⚠️ 图片渲染失败，已切换为文字模式\n\n{text_msg}")
 
     async def _render_rank_as_text(self, event: AstrMessageEvent, filtered_data: List[tuple],
                                  group_info: GroupInfo, title: str, config: PluginConfig):

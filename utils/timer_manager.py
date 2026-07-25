@@ -1,4 +1,3 @@
-import os
 """
 定时任务管理器 - 最终修复版本
 实现定时排行榜推送功能，采用正确的AstrBot主动消息API
@@ -10,6 +9,7 @@ import os
 4. 确保定时推送完全自动化，不需要手动执行命令
 """
 
+import os
 import asyncio
 import re
 import json
@@ -28,17 +28,16 @@ except ImportError:
     CRONITER_AVAILABLE = False
 
 from astrbot.api import logger as astrbot_logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-# PlatformAdapterType 在 astrbot.api.event.filter 中
-# 移除消息组件导入，使用MessageChain
+from astrbot.api.event import MessageChain
 
 from .models import RankType, UserData, GroupInfo
 from .data_manager import DataManager
-from .image_generator import ImageGenerator
+from .image_generator import ImageGenerationError, ImageGenerator
 from .llm_analyzer import LLMAnalyzer
 from .date_utils import get_current_date, get_week_start, get_month_start
 from .exception_handlers import safe_timer_operation, safe_generation, safe_data_operation
 from .group_id_utils import get_fallback_group_name, is_placeholder_group_name
+from .t2i_renderer import T2IRenderError, get_container_width, render_html
 
 
 class TimerTaskStatus(Enum):
@@ -99,9 +98,13 @@ class PushService:
             # 构建MessageChain
             message_chain = MessageChain()
             
-            # 如果有图片，添加到MessageChain
-            if image_path and os.path.exists(image_path):
-                message_chain = message_chain.file_image(image_path)
+            # T2I 返回 URL，定时推送不再创建或读取本地截图文件。
+            if image_path:
+                if image_path.startswith(("http://", "https://")):
+                    message_chain = message_chain.url_image(image_path)
+                else:
+                    self.logger.error(f"图片地址不可用: {image_path}")
+                    return False
             
             # 如果有文字消息，添加到MessageChain
             if message and message.strip():
@@ -164,7 +167,8 @@ class TimerManager:
     _lock_file_base: Optional[str] = None
     
     
-    def __init__(self, data_manager: DataManager, image_generator: ImageGenerator, context=None, group_unified_msg_origins: Dict[str, str] = None):
+    def __init__(self, data_manager: DataManager, image_generator: ImageGenerator, context=None,
+                 group_unified_msg_origins: Dict[str, str] = None, get_t2i_endpoint=None):
         """初始化定时任务管理器
         
         Args:
@@ -172,11 +176,13 @@ class TimerManager:
             image_generator (ImageGenerator): 图片生成器实例
             context: AstrBot上下文对象
             group_unified_msg_origins: 群组unified_msg_origin映射表
+            get_t2i_endpoint: 返回当前 T2I 服务端点的回调
         """
         self.data_manager = data_manager
         self.image_generator = image_generator
         self.context = context
         self.group_unified_msg_origins = group_unified_msg_origins or {}
+        self.get_t2i_endpoint = get_t2i_endpoint
         
         # 初始化推送服务（即使context为None也创建实例）
         self.push_service = PushService(context, self.group_unified_msg_origins)
@@ -827,28 +833,17 @@ class TimerManager:
         title = rank_title
         
         # 定时推送只发送图片版本
-        image_path = await self._generate_rank_image(users_for_rank, group_info, title, config, token_usage_info)
-        if not image_path:
+        image_url = await self._generate_rank_image_url(users_for_rank, group_info, title, config, token_usage_info)
+        if not image_url:
             self.logger.warning(f"群组 {group_id} 图片生成失败")
             return False
         
         # 定时推送只发送图片，不发送文字消息
-        try:
-            success = await self.push_service.push_to_group(group_id, "", image_path)
-        finally:
-            # 清理临时图片文件（确保无论push_to_group是否异常都执行）
-            if image_path:
-                try:
-                    if os.path.exists(image_path):
-                        os.unlink(image_path)
-                except Exception as e:
-                    self.logger.warning(f"清理临时图片文件失败: {image_path}, 错误: {e}")
-        
-        return success
+        return await self.push_service.push_to_group(group_id, "", image_url)
     
     @safe_generation(default_return=None)
-    async def _generate_rank_image(self, users: List[UserData], group_info: GroupInfo, title: str, config, token_usage: Dict[str, int] = None) -> Optional[str]:
-        """生成排行榜图片
+    async def _generate_rank_image_url(self, users: List[UserData], group_info: GroupInfo, title: str, config, token_usage: Dict[str, int] = None) -> Optional[str]:
+        """生成排行榜的 T2I 图片 URL。
         
         Args:
             users: 用户数据列表
@@ -857,10 +852,10 @@ class TimerManager:
             config: 插件配置对象
             
         Returns:
-            Optional[str]: 图片路径，失败时返回None
+            Optional[str]: 图片 URL，失败时返回 None
         """
         try:
-            if not self.image_generator:
+            if not self.image_generator or not self.get_t2i_endpoint:
                 return None
             
             # 从users中提取titles_map（已经由_push_to_group设置好了display_title和display_title_color）
@@ -873,16 +868,18 @@ class TimerManager:
                     else:
                         titles_map[user.user_id] = user.display_title
             
-            # 使用图片生成器生成图片
-            temp_path = await self.image_generator.generate_rank_image(
-                users, group_info, title, "0", token_usage, titles_map  # 系统推送，用户ID设为"0"
+            html_content = await self.image_generator.generate_rank_html(
+                users, group_info, title, "0", token_usage, titles_map
             )
-            
-            return temp_path
+            return await render_html(
+                self.get_t2i_endpoint(),
+                html_content,
+                get_container_width(html_content, self.image_generator.width),
+            )
 
             
-        except Exception as e:
-            self.logger.error(f"生成排行榜图片失败: {e}")
+        except (ImageGenerationError, T2IRenderError, OSError, ValueError) as e:
+            self.logger.error(f"生成排行榜 T2I 图片失败: {e}")
             return None
     
     def _format_timer_task_label(self, task) -> str:

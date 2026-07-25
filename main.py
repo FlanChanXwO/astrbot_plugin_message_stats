@@ -5,9 +5,8 @@ AstrBot 群发言统计插件
 
 # 标准库导入
 import asyncio
-import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Set
 
@@ -27,6 +26,7 @@ from .utils.stats_mixin import StatsMixin
 from .utils.ranking_mixin import CUSTOM_DATE_RANK_MESSAGE_PATTERN, RankingMixin
 from .utils.models import GroupInfo, PluginConfig, RankType, UserData
 from .utils.exception_handlers import ExceptionConfig, exception_handler
+from .utils.t2i_renderer import render_html, resolve_endpoint
 from .utils.constants import (
     USER_NICKNAME_CACHE_TTL,
     GROUP_MEMBERS_CACHE_TTL as CACHE_TTL_SECONDS,
@@ -192,18 +192,6 @@ class MessageStatsPlugin(Star):
         # 里程碑目标 set 缓存
         self._milestone_set: Set[int] = set(getattr(self.plugin_config, 'milestone_targets', []))
 
-    def _schedule_file_cleanup(self, file_path: str, delay_seconds: int = 300):
-        if file_path:
-            asyncio.create_task(self._cleanup_file_later(str(file_path), delay_seconds))
-
-    async def _cleanup_file_later(self, file_path: str, delay_seconds: int):
-        try:
-            await asyncio.sleep(delay_seconds)
-            if os.path.exists(file_path):
-                os.unlink(file_path)
-        except OSError as e:
-            self.logger.warning(f"清理临时图片文件失败: {file_path}, 错误: {e}")
-
     def _convert_to_plugin_config(self) -> PluginConfig:
         """将AstrBot配置转换为插件配置对象"""
         try:
@@ -250,7 +238,7 @@ class MessageStatsPlugin(Star):
                 if old_val in ('文字', '0', 'false', 'off', 'no'):
                     config_dict['render_mode'] = 'text'
                 else:
-                    config_dict['render_mode'] = 'playwright'
+                    config_dict['render_mode'] = 't2i'
             
             # 使用PluginConfig.from_dict()方法进行安全的配置转换
             config = PluginConfig.from_dict(config_dict)
@@ -259,6 +247,10 @@ class MessageStatsPlugin(Star):
             self.logger.error(f"配置转换失败: {e}")
             self.logger.info("使用默认配置继续运行")
             return PluginConfig()
+
+    def _get_t2i_endpoint(self) -> str:
+        """解析当前插件实际应使用的 T2I 服务端点。"""
+        return resolve_endpoint(self.plugin_config, self.context)
     
     # ========== 类常量定义 ==========
     
@@ -422,7 +414,13 @@ class MessageStatsPlugin(Star):
         """
         try:
             from .utils.timer_manager import TimerManager
-            self.timer_manager = TimerManager(self.data_manager, self.image_generator, self.context, self.group_unified_msg_origins)
+            self.timer_manager = TimerManager(
+                self.data_manager,
+                self.image_generator,
+                self.context,
+                self.group_unified_msg_origins,
+                self._get_t2i_endpoint,
+            )
             self.timer_manager.update_group_name_cache_batch(self._web_group_name_cache)
             self.logger.info("定时任务管理器初始化成功")
             # 注意：定时任务的启动在 _setup_caches 中统一进行，避免重复启动
@@ -693,8 +691,7 @@ class MessageStatsPlugin(Star):
                 yield event.plain_result("图片生成器未初始化，无法生成个人里程碑卡片！")
                 return
 
-            # 生成里程碑个人成就卡片
-            image_path = await self.image_generator.generate_milestone_image(
+            html_content = await self.image_generator.generate_milestone_html(
                 user_id=user_id,
                 nickname=nickname,
                 milestone_count=current_count,
@@ -706,14 +703,12 @@ class MessageStatsPlugin(Star):
                 percentage=percentage,
                 group_info=group_info
             )
-            
-            if not image_path:
+            if not html_content:
                 yield event.plain_result("个人里程碑卡片生成失败！")
                 return
-            
-            # 使用框架标准的 image_result 返回图片
-            yield event.image_result(image_path)
-            self._schedule_file_cleanup(image_path)
+
+            image_url = await render_html(self._get_t2i_endpoint(), html_content, 600)
+            yield event.image_result(image_url)
 
         except Exception as e:
             self.logger.error(f"里程碑获取失败: {e}", exc_info=True)
@@ -895,10 +890,10 @@ class MessageStatsPlugin(Star):
             }
             
             if self.plugin_config.if_send_pic and self.image_generator:
-                img_path = await self.image_generator.generate_personal_stats_image(data, group_info)
-                if img_path:
-                    yield event.image_result(img_path)
-                    self._schedule_file_cleanup(img_path)
+                html_content = await self.image_generator.generate_personal_stats_html(data, group_info)
+                if html_content:
+                    image_url = await render_html(self._get_t2i_endpoint(), html_content, 480)
+                    yield event.image_result(image_url)
                     return
             
             text = f"【个人发言统计】\n用户: {nickname} ({target_uid})\n"

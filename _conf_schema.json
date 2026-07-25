@@ -56,9 +56,15 @@
   "render_mode": {
     "type": "string",
     "description": "图片渲染方式",
-    "hint": "playwright：本地 Chromium 渲染，失败自动尝试 t2i → 均失败则降级为纯文字。t2i：使用 AstrBot 文转图服务，失败自动尝试 playwright → 均失败则降级为纯文字。text：纯文字输出",
-    "default": "playwright",
-    "options": ["playwright", "t2i", "text"]
+    "hint": "t2i：使用 AstrBot 文转图服务生成图片，不启动本地 Chromium；服务端按模板宽度截图。text：纯文字输出。",
+    "default": "t2i",
+    "options": ["t2i", "text"]
+  },
+  "t2i_endpoint": {
+    "type": "string",
+    "description": "T2I 服务端点（可选）",
+    "hint": "留空时继承 AstrBot 全局 t2i_endpoint；本机服务示例：http://localhost:8999/text2img。服务必须支持 /generate 的 html 请求字段。",
+    "default": ""
   },
   "timer_tasks": {
     "type": "template_list",
