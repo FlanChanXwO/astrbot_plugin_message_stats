@@ -6,18 +6,14 @@
 import re
 import asyncio
 from pathlib import Path
-from typing import Any, Optional, List, Dict, Callable
-from datetime import datetime, date
+from typing import Any, Optional, List, Dict
+from datetime import datetime
 from astrbot.api import logger as astrbot_logger
 import bleach
 
 
 # 从集中管理的常量模块导入验证常量
 from .constants import (
-    GROUP_ID_MIN_LENGTH,
-    GROUP_ID_MAX_LENGTH,
-    USER_ID_MIN_LENGTH,
-    USER_ID_MAX_LENGTH,
     NICKNAME_MAX_LENGTH,
     IMAGE_MODE_TEXT,
     IMAGE_MODE_IMAGE,
