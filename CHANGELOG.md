@@ -3,7 +3,7 @@
 ## 未发布
 
 ### 🐛 依赖修复
-- **HTML 安全清理**：将生产代码实际使用的 `bleach` 加回插件 `requirements.txt`，避免官方 AstrBot 镜像按插件依赖安装时退回基础转义路径。
+- **HTML 安全清理**：将生产代码实际使用的 `bleach` 加回插件 `requirements.txt` 并作为必需导入，让 AstrBot 可自动安装缺失依赖，避免退回基础转义路径。
 
 ### ♻️ 渲染链路重构
 - **仅保留 AstrBot T2I**：排行榜、个人统计、里程碑和定时推送直接调用 T2I 的 `/generate` HTML 接口生成图片 URL，不再启动本地 Chromium。

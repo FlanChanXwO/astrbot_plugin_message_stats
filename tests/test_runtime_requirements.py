@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 REQUIREMENTS_PATH = Path(__file__).parents[1] / "requirements.txt"
+VALIDATORS_PATH = Path(__file__).parents[1] / "utils" / "validators.py"
 
 
 class RuntimeRequirementsTests(unittest.TestCase):
@@ -14,3 +15,9 @@ class RuntimeRequirementsTests(unittest.TestCase):
         requirements = REQUIREMENTS_PATH.read_text(encoding="utf-8")
 
         self.assertIn("bleach>=6.0.0", requirements)
+
+    def test_html_sanitizer_requires_declared_bleach(self):
+        validators = VALIDATORS_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("import bleach", validators)
+        self.assertNotIn("bleach = None", validators)

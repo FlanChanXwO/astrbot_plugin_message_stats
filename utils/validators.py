@@ -9,13 +9,7 @@ from pathlib import Path
 from typing import Any, Optional, List, Dict, Callable
 from datetime import datetime, date
 from astrbot.api import logger as astrbot_logger
-import html
-
-
-try:
-    import bleach
-except ImportError:
-    bleach = None
+import bleach
 
 
 # 从集中管理的常量模块导入验证常量
@@ -476,8 +470,7 @@ class Validators:
     def sanitize_html_content(content: str) -> str:
         """清理HTML内容
         
-        使用bleach库清理HTML内容，移除危险标签和属性。
-        如果bleach库未安装，则回退到使用html.escape进行基础HTML转义。
+        使用已声明的 bleach 依赖清理 HTML 内容，移除危险标签和属性。
         
         Args:
             content (str): 要清理的HTML内容
@@ -491,12 +484,6 @@ class Validators:
         """
         if not content:
             return ""
-        
-        if bleach is None:
-            # 记录警告日志
-            Validators.logger.warning("bleach库未安装，使用基础HTML转义作为备选方案")
-            # 回退到基础HTML转义
-            return html.escape(content)
         
         # 定义允许的标签和属性
         allowed_tags = ['p', 'br', 'strong', 'em', 'u', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 
