@@ -1,6 +1,9 @@
 # Jinja2 模板引擎
 jinja2>=3.1.0
 
+# HTML 安全清理
+bleach>=6.0.0
+
 # 异步文件操作
 aiofiles>=24.1.0
 

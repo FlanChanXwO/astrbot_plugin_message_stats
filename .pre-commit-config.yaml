@@ -3,6 +3,6 @@ repos:
     hooks:
       - id: t2i-renderer-tests
         name: T2I renderer regression tests
-        entry: python3 -m unittest discover -s tests -p test_t2i_renderer.py
+        entry: python3 -m unittest discover -s tests
         language: system
         pass_filenames: false
